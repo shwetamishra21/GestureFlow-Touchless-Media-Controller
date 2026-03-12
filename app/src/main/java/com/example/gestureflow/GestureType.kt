@@ -1,4 +1,4 @@
-package com.gestureflow
+package com.example.gestureflow
 
 enum class GestureType {
     NONE,
