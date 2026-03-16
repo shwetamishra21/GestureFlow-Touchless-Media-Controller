@@ -11,6 +11,8 @@ import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
+import kotlin.math.sqrt
+import kotlin.math.abs
 
 class HandGestureDetector(private val context: Context) {
 
@@ -35,9 +37,9 @@ class HandGestureDetector(private val context: Context) {
             val options = HandLandmarker.HandLandmarkerOptions.builder()
                 .setBaseOptions(baseOptions)
                 .setNumHands(1)
-                .setMinHandDetectionConfidence(0.5f)
-                .setMinHandPresenceConfidence(0.5f)
-                .setMinTrackingConfidence(0.5f)
+                .setMinHandDetectionConfidence(0.3f)   // was 0.5 — more forgiving
+                .setMinHandPresenceConfidence(0.3f)    // was 0.5
+                .setMinTrackingConfidence(0.3f)        // was 0.5
                 .setRunningMode(RunningMode.IMAGE)
                 .build()
 
@@ -50,27 +52,29 @@ class HandGestureDetector(private val context: Context) {
 
     fun detect(imageProxy: ImageProxy): DetectionResult {
         return try {
-            // Always rotate to upright — front camera is typically 270°
             val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-            val bitmap = imageProxy.toBitmap().rotateBitmap(rotationDegrees.toFloat())
+            var bitmap = imageProxy.toBitmap()
+
+            // For front camera: rotate AND mirror horizontally
+            bitmap = bitmap.rotateBitmap(rotationDegrees.toFloat())
+            bitmap = bitmap.mirrorHorizontally()
 
             val mpImage = BitmapImageBuilder(bitmap).build()
             val result = handLandmarker?.detect(mpImage)
 
             if (result == null || result.landmarks().isEmpty()) {
-                Log.d(TAG, "No hand detected (rotation was $rotationDegrees°)")
+                Log.d(TAG, "No hand detected")
                 DetectionResult(gesture = GestureType.NONE, landmarks = null)
             } else {
                 val landmarks = result.landmarks()[0]
 
-                // Log raw landmark y-values to verify orientation
-                Log.d(TAG, "Hand detected! index tip y=${landmarks[8].y()}, " +
+                Log.d(TAG, "Landmarks: wrist y=${landmarks[0].y()}, " +
+                        "index tip y=${landmarks[8].y()}, " +
                         "index pip y=${landmarks[6].y()}, " +
-                        "middle tip y=${landmarks[12].y()}, " +
-                        "wrist y=${landmarks[0].y()}")
+                        "thumb tip y=${landmarks[4].y()}")
 
-                val gestureType = classifyGesture(landmarks)
                 val pinchDistance = getPinchDistance(landmarks)
+                val gestureType = classifyGesture(landmarks, pinchDistance)
 
                 Log.d(TAG, "Gesture=$gestureType  pinch=$pinchDistance")
 
@@ -86,31 +90,40 @@ class HandGestureDetector(private val context: Context) {
         }
     }
 
-    private fun classifyGesture(landmarks: List<NormalizedLandmark>): GestureType {
-        // In normalized coords: y=0 is TOP of image, y=1 is BOTTOM
-        // So fingertip EXTENDED means tip.y < pip.y (tip is higher up = smaller y)
-        val indexExtended  = landmarks[8].y()  < landmarks[6].y()
-        val middleExtended = landmarks[12].y() < landmarks[10].y()
-        val ringExtended   = landmarks[16].y() < landmarks[14].y()
-        val pinkyExtended  = landmarks[20].y() < landmarks[18].y()
+    private fun classifyGesture(
+        landmarks: List<NormalizedLandmark>,
+        pinchDistance: Float
+    ): GestureType {
+        // y=0 is TOP, y=1 is BOTTOM in normalized coords
+        // Extended finger = tip.y < pip.y (tip is higher = smaller y value)
+        val indexExtended  = landmarks[8].y()  < landmarks[6].y()  - FINGER_BEND_THRESHOLD
+        val middleExtended = landmarks[12].y() < landmarks[10].y() - FINGER_BEND_THRESHOLD
+        val ringExtended   = landmarks[16].y() < landmarks[14].y() - FINGER_BEND_THRESHOLD
+        val pinkyExtended  = landmarks[20].y() < landmarks[18].y() - FINGER_BEND_THRESHOLD
 
-        val pinchDist = getPinchDistance(landmarks)
-        val isPinching = pinchDist < PINCH_THRESHOLD
+        // Thumb: compare x-distance from wrist instead of y (thumb moves laterally)
+        val thumbExtended = abs(landmarks[4].x() - landmarks[0].x()) >
+                abs(landmarks[3].x() - landmarks[0].x()) + 0.02f
 
-        Log.d(TAG, "index=$indexExtended middle=$middleExtended " +
-                "ring=$ringExtended pinky=$pinkyExtended pinch=$pinchDist")
+        Log.d(TAG, "Fingers → index=$indexExtended middle=$middleExtended " +
+                "ring=$ringExtended pinky=$pinkyExtended thumb=$thumbExtended " +
+                "pinch=$pinchDistance")
 
         return when {
-            isPinching -> GestureType.PINCH
-
-            !indexExtended && !middleExtended &&
-                    !ringExtended && !pinkyExtended -> GestureType.FIST
-
+            // Open palm — all 4 fingers clearly extended (check this BEFORE pinch)
             indexExtended && middleExtended &&
                     ringExtended && pinkyExtended -> GestureType.OPEN_PALM
 
+            // Fist — all 4 fingers folded
+            !indexExtended && !middleExtended &&
+                    !ringExtended && !pinkyExtended -> GestureType.FIST
+
+            // Two fingers — index + middle up, ring + pinky down
             indexExtended && middleExtended &&
                     !ringExtended && !pinkyExtended -> GestureType.TWO_FINGERS
+
+            // Pinch — checked last so open palm doesn't get swallowed
+            pinchDistance < PINCH_THRESHOLD -> GestureType.PINCH
 
             else -> GestureType.NONE
         }
@@ -121,7 +134,7 @@ class HandGestureDetector(private val context: Context) {
         val indexTip = landmarks[8]
         val dx = thumbTip.x() - indexTip.x()
         val dy = thumbTip.y() - indexTip.y()
-        return kotlin.math.sqrt(dx * dx + dy * dy)
+        return sqrt(dx * dx + dy * dy)
     }
 
     fun close() {
@@ -130,12 +143,18 @@ class HandGestureDetector(private val context: Context) {
 
     companion object {
         private const val TAG = "GestureDetector"
-        private const val PINCH_THRESHOLD = 0.08f
+        private const val PINCH_THRESHOLD = 0.12f       // was 0.08 — easier to trigger
+        private const val FINGER_BEND_THRESHOLD = 0.02f // hysteresis buffer to reduce noise
     }
 }
 
 fun Bitmap.rotateBitmap(degrees: Float): Bitmap {
     if (degrees == 0f) return this
     val matrix = Matrix().apply { postRotate(degrees) }
+    return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
+}
+
+fun Bitmap.mirrorHorizontally(): Bitmap {
+    val matrix = Matrix().apply { postScale(-1f, 1f, width / 2f, height / 2f) }
     return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
 }
